@@ -28,8 +28,12 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                    .view(1, 1, config.block_size, config.block_size))
+        
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_prodcut_attention')
+        if not self.flash:
+            print("WARNING: flash attention is not available, using slower implementation")
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
         
     def forward(self, x):
         B, T, C = x.size()
@@ -38,17 +42,16 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         
-        att = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        if self.flash:
+            # https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            att = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
         
         y = self.resid_dropout(self.c_proj(y))
         return y
-        
-        
-        
-        
-        

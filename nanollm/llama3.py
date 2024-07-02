@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 
-
 from dataclasses import dataclass
 from torch.nn import functional as F
-
 from transformers import AutoModelForCausalLM
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "6,7"
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -19,6 +21,17 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 @dataclass
@@ -100,7 +113,8 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         self.n_head = config.n_head
         self.head_dim = config.hidden_size // self.n_head
-        
+        self.n_kv_head = config.n_kv_head
+        self.n_kv_group = self.n_head // self.n_kv_head
         self.q_proj = nn.Linear(config.hidden_size, config.n_head * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(config.hidden_size, config.n_kv_head * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(config.hidden_size, config.n_kv_head * self.head_dim, bias=config.attention_bias)
@@ -121,9 +135,12 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) 
         k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
-        position_ids = torch.arange(0, T,  dtype=torch.long, device=x.device)
+        position_ids = torch.arange(0, T, dtype=torch.long, device=x.device).unsqueeze(0).expand(B, T)
         cos, sin = self.rotary_emb(v, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        
+        k = repeat_kv(k, self.n_kv_group)
+        v = repeat_kv(v, self.n_kv_group)
         
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
@@ -142,7 +159,7 @@ class Block(nn.Module):
         self.post_attention_layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         
     def forward(self, x):
-        x = x + self.attn(self.input_layernorm(x))
+        x = x + self.self_attn(self.input_layernorm(x))
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -150,6 +167,7 @@ class Llama(nn.Module):
     
     def __init__(self, config):
         super().__init__()
+        self.config = config
         # ? pad token id
         
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -234,5 +252,32 @@ class Llama(nn.Module):
 
         return model
     
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"using device: {device}")
+    
 model = Llama.from_pretrained("llama3-8b")
+model.to(device)
+model.eval()
+
 print("load successful")
+
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+
+idx = tokenizer.apply_chat_template([
+    {"role": "user", "content": "你是谁?"}
+], tokenize=True)
+idx = torch.tensor(idx).unsqueeze(0).to(device)
+
+logits, loss = model(idx)
+probs = torch.softmax(logits[0, -1], dim=0)
+topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+sample_rng = torch.Generator(device=device)
+ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
+xcol = torch.gather(topk_indices, -1, ix)
+print("decode sample:", tokenizer.decode(xcol.tolist()))
+

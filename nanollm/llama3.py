@@ -6,7 +6,7 @@ from torch.nn import functional as F
 from transformers import AutoModelForCausalLM
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -210,6 +210,7 @@ class Llama(nn.Module):
     def from_pretrained(cls, model_type):
         assert model_type in {'llama3-8b'}
         config_args = {
+            'llama3-gpt2': dict(n_layer=12, n_head=32, n_kv_head=8, n_embd=768),
             'llama3-8b': dict(n_layer=32),
         }[model_type]
         config_args['vocab_size'] = 128256
@@ -220,9 +221,9 @@ class Llama(nn.Module):
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.bias')]
         
-        model_id = 'meta-llama/Meta-Llama-3-8B-Instruct'
+        model_id = 'Undi95/Meta-Llama-3-8B-hf'
         if model_type == 'llama3-8b':
-            model_id = 'meta-llama/Meta-Llama-3-8B-Instruct'
+            model_id = 'Undi95/Meta-Llama-3-8B-hf'
         
         model_hf = AutoModelForCausalLM.from_pretrained(model_id)
         sd_hf = model_hf.state_dict()
@@ -258,26 +259,77 @@ if torch.cuda.is_available():
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
-    
-model = Llama.from_pretrained("llama3-8b")
-model.to(device)
-model.eval()
-
-print("load successful")
 
 from transformers import AutoTokenizer
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained("Undi95/Meta-Llama-3-8B-hf")
 
-idx = tokenizer.apply_chat_template([
-    {"role": "user", "content": "你是谁?"}
-], tokenize=True)
-idx = torch.tensor(idx).unsqueeze(0).to(device)
+with open('./input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = tokenizer.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])
+buf = buf.to(device)
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
 
-logits, loss = model(idx)
-probs = torch.softmax(logits[0, -1], dim=0)
-topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-sample_rng = torch.Generator(device=device)
-ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
-xcol = torch.gather(topk_indices, -1, ix)
-print("decode sample:", tokenizer.decode(xcol.tolist()))
+config_args = {
+    'llama3-gpt2': dict(n_layer=12, n_head=32, n_kv_head=8, hidden_size=768),
+    'llama3-8b': dict(n_layer=32),
+}['llama3-gpt2']
+config_args['vocab_size'] = 128256
+        
+config = LlamaConfig(**config_args)
+model = Llama(config)
+model.to(device)
+print("load successful")
+
+# optimize!
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# for i in range(50):
+#     optimizer.zero_grad()
+#     logits, loss = model(x, y)
+#     loss.backward()
+#     optimizer.step()
+#     print(f"step {i}, loss: {loss.item()}")
+
+# import sys; sys.exit(0)
+
+model.eval()
+num_return_sequences = 5
+max_length = 30
+
+tokens = tokenizer.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+x = tokens.to(device)
+
+# generate! right now x is (B, T) where B = 5, T = 8
+# set the seed to 42
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    # forward the model to get the logits
+    with torch.no_grad():
+        logits, _ = model(x) # (B, T, vocab_size)
+        # take the logits at the last position
+        logits = logits[:, -1, :] # (B, vocab_size)
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1)
+        # do top-k sampling of 50 (huggingface pipeline default)
+        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from the top-k probabilities
+        # note: multinomial does not demand the input to sum to 1
+        ix = torch.multinomial(topk_probs, 1) # (B, 1)
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+        # append to the sequence
+        x = torch.cat((x, xcol), dim=1)
+
+# print the generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = tokenizer.decode(tokens)
+    print(">", decoded)
 

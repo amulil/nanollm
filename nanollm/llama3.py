@@ -221,9 +221,9 @@ class Llama(nn.Module):
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.bias')]
         
-        model_id = 'Undi95/Meta-Llama-3-8B-hf'
+        model_id = 'google/gemma-2-27b-it'
         if model_type == 'llama3-8b':
-            model_id = 'Undi95/Meta-Llama-3-8B-hf'
+            model_id = 'google/gemma-2-27b-it'
         
         model_hf = AutoModelForCausalLM.from_pretrained(model_id)
         sd_hf = model_hf.state_dict()
@@ -253,6 +253,36 @@ class Llama(nn.Module):
 
         return model
     
+from transformers import AutoTokenizer
+
+class DataLoaderLite:
+    
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        
+        with open('./input.txt', 'r') as f:
+            text = f.read()
+        tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-27b-it")
+        tokens = tokenizer.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(tokens)} tokens")
+        print(f"1 epoch = {len(tokens) // (B * T)} batches")
+        
+        # state
+        self.current_position = 0
+        
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position:self.current_position + B * T + 1]
+        x, y = (buf[:-1]).view(B, T), buf[1:].view(B, T)
+        self.current_position += B * T
+        if self.current_position + (B * T + 1) >= len(self.tokens): # ?? why
+            self.current_position = 0
+        return x, y
+    
+train_loader = DataLoaderLite(B=4, T=32)
+
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -260,18 +290,6 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
 
-from transformers import AutoTokenizer
-tokenizer = AutoTokenizer.from_pretrained("Undi95/Meta-Llama-3-8B-hf")
-
-with open('./input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = tokenizer.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])
-buf = buf.to(device)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
 
 config_args = {
     'llama3-gpt2': dict(n_layer=12, n_head=32, n_kv_head=8, hidden_size=768),
@@ -285,15 +303,17 @@ model.to(device)
 print("load successful")
 
 # optimize!
-# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-# for i in range(50):
-#     optimizer.zero_grad()
-#     logits, loss = model(x, y)
-#     loss.backward()
-#     optimizer.step()
-#     print(f"step {i}, loss: {loss.item()}")
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
 
-# import sys; sys.exit(0)
+import sys; sys.exit(0)
 
 model.eval()
 num_return_sequences = 5

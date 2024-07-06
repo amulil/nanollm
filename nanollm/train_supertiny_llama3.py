@@ -9,7 +9,7 @@ from torch.nn import functional as F
 from transformers import AutoModelForCausalLM
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "6"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # === model ===
@@ -106,7 +106,7 @@ class RoPE(nn.Module):
         # See https://github.com/huggingface/transformers/pull/29285
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=True): # need to look
+        with torch.autocast(device_type=device_type, enabled=True): # ?? need to look
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
@@ -220,6 +220,31 @@ class Llama(nn.Module):
         num_params = sum(p.numel() for p in params)
         print(f"{num_params / 1e10:.3f}B parameters")
         
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+    
     
     @classmethod
     def from_pretrained(cls, model_type):
@@ -271,44 +296,82 @@ from transformers import AutoTokenizer
 
 class DataLoaderLite:
     
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
         
         with open('./input.txt', 'r') as f:
             text = f.read()
         tokenizer = AutoTokenizer.from_pretrained("Undi95/Meta-Llama-3-8B-hf")
         tokens = tokenizer.encode(text)
         self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(tokens)} tokens")
-        print(f"1 epoch = {len(tokens) // (B * T)} batches")
-        
+        if master_process:
+            print(f"loaded {len(tokens)} tokens")
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
         
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position:self.current_position + B * T + 1]
         x, y = (buf[:-1]).view(B, T), buf[1:].view(B, T)
-        self.current_position += B * T
-        if self.current_position + (B * T + 1) >= len(self.tokens): # ?? why
-            self.current_position = 0
+        self.current_position += B * T * self.num_processes
+        if self.current_position + (B * T * self.num_processes + 1) >= len(self.tokens): # ?? why
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
+# simple launch:
+# python train_supertiny_llama3.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train_supertiny_llama3.py
+
+# === train ===
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
     
+
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
     
-train_loader = DataLoaderLite(B=4, T=4096)
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+B = 4 # micro batch size
+T = 4096 # sequence length
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 torch.set_float32_matmul_precision('high')
-
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"using device: {device}")
-
 
 config_args = {
     'supertiny-llama3': dict(n_layer=8, n_head=32, n_kv_head=8, hidden_size=512),
@@ -320,9 +383,13 @@ config = LlamaConfig(**config_args)
 model = Llama(config)
 model.to(device)
 model = torch.compile(model)
-print("load successful");model.print_params_number()
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model # ??
+# if master_process:
+    # print("load successful");
+    # raw_model.print_params_number()
 
-# === train ===
 # lr
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -343,16 +410,28 @@ def get_lr(it):
 
 
 # optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-        # import code; code.interact(local = locals()) # ？？ why failed
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        # we have to scale the loss to account for gradient accumulation,
+        # because the gradients just add on each successive backward().
+        # addition of gradients corresponds to a SUM in the objective, but
+        # instead of a SUM we want MEAN. Scale the loss here so it comes out right
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # ??
+        loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    # import code; code.interact(local = locals()) # ？？ why failed
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -361,8 +440,13 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / dt
+    if master_process:
+        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+
+if ddp:
+    destroy_process_group()
 
 import sys; sys.exit(0)
 

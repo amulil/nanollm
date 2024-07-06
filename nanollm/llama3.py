@@ -1,3 +1,6 @@
+import time
+import math
+import inspect
 import torch
 import torch.nn as nn
 
@@ -7,6 +10,7 @@ from transformers import AutoModelForCausalLM
 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "6"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # === model ===
 def rotate_half(x):
@@ -102,7 +106,7 @@ class RoPE(nn.Module):
         # See https://github.com/huggingface/transformers/pull/29285
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
+        with torch.autocast(device_type=device_type, enabled=True): # need to look
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
@@ -144,7 +148,6 @@ class CausalSelfAttention(nn.Module):
         
         k = repeat_kv(k, self.n_kv_group)
         v = repeat_kv(v, self.n_kv_group)
-        
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.o_proj(y)
@@ -210,6 +213,13 @@ class Llama(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
+    
+    def print_params_number(self):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        params = [p for n, p in param_dict.items()]
+        num_params = sum(p.numel() for p in params)
+        print(f"{num_params / 1e10:.3f}B parameters")
+        
     
     @classmethod
     def from_pretrained(cls, model_type):
@@ -289,7 +299,8 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
     
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=4, T=4096)
+torch.set_float32_matmul_precision('high')
 
 device = "cpu"
 if torch.cuda.is_available():
@@ -308,19 +319,50 @@ config_args['vocab_size'] = 128256
 config = LlamaConfig(**config_args)
 model = Llama(config)
 model.to(device)
-print("load successful")
+model = torch.compile(model)
+print("load successful");model.print_params_number()
 
 # === train ===
+# lr
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+
 # optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+for step in range(max_steps):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+        # import code; code.interact(local = locals()) # ？？ why failed
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = t1 - t0
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 

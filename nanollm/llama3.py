@@ -8,6 +8,7 @@ from transformers import AutoModelForCausalLM
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 
+# === model ===
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -57,6 +58,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
         self.silu = nn.SiLU()
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+        self.down_proj.NANOGPT_SCALE_INIT = 1
     def forward(self, x):
         gate_x, up_x = self.gate_proj(x), self.up_proj(x)
         x = self.silu(gate_x)
@@ -119,6 +121,7 @@ class CausalSelfAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, config.n_kv_head * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(config.hidden_size, config.n_kv_head * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
+        self.o_proj.NANOGPT_SCALE_INIT = 1
         self.rotary_emb = RoPE(
             self.head_dim,
             max_position_embeddings=config.max_position_embeddings,
@@ -180,6 +183,8 @@ class Llama(nn.Module):
 
         # init params
         self.apply(self._init_weights)
+        
+        
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02
@@ -221,9 +226,9 @@ class Llama(nn.Module):
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.bias')]
         
-        model_id = 'google/gemma-2-27b-it'
+        model_id = 'Undi95/Meta-Llama-3-8B-hf'
         if model_type == 'llama3-8b':
-            model_id = 'google/gemma-2-27b-it'
+            model_id = 'Undi95/Meta-Llama-3-8B-hf'
         
         model_hf = AutoModelForCausalLM.from_pretrained(model_id)
         sd_hf = model_hf.state_dict()
@@ -235,8 +240,6 @@ class Llama(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        print(sd_keys_hf)
-        print(sd_keys)
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
@@ -252,7 +255,8 @@ class Llama(nn.Module):
                     sd[_k].copy_(sd_hf[k])
 
         return model
-    
+
+# === data === 
 from transformers import AutoTokenizer
 
 class DataLoaderLite:
@@ -263,7 +267,7 @@ class DataLoaderLite:
         
         with open('./input.txt', 'r') as f:
             text = f.read()
-        tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-27b-it")
+        tokenizer = AutoTokenizer.from_pretrained("Undi95/Meta-Llama-3-8B-hf")
         tokens = tokenizer.encode(text)
         self.tokens = torch.tensor(tokens)
         print(f"loaded {len(tokens)} tokens")
@@ -281,6 +285,10 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
     
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+    
 train_loader = DataLoaderLite(B=4, T=32)
 
 device = "cpu"
@@ -292,9 +300,9 @@ print(f"using device: {device}")
 
 
 config_args = {
-    'llama3-gpt2': dict(n_layer=12, n_head=32, n_kv_head=8, hidden_size=768),
+    'supertiny-llama3': dict(n_layer=8, n_head=32, n_kv_head=8, hidden_size=512),
     'llama3-8b': dict(n_layer=32),
-}['llama3-gpt2']
+}['supertiny-llama3']
 config_args['vocab_size'] = 128256
         
 config = LlamaConfig(**config_args)
@@ -302,6 +310,7 @@ model = Llama(config)
 model.to(device)
 print("load successful")
 
+# === train ===
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):

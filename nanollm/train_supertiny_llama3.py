@@ -218,7 +218,7 @@ class Llama(nn.Module):
         param_dict = {pn: p for pn, p in self.named_parameters()}
         params = [p for n, p in param_dict.items()]
         num_params = sum(p.numel() for p in params)
-        print(f"{num_params / 1e10:.3f}B parameters")
+        print(f"{num_params / 1e9:.3f}B parameters")
         
     def configure_optimizers(self, weight_decay, learning_rate, device):
         # start with all of the candidate parameters (that require grad)
@@ -356,6 +356,7 @@ else:
         device = "mps"
     print(f"using device: {device}")
     
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -384,11 +385,11 @@ model = Llama(config)
 model.to(device)
 model = torch.compile(model)
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 raw_model = model.module if ddp else model # ??
-# if master_process:
-    # print("load successful");
-    # raw_model.print_params_number()
+if master_process:
+    print("load successful");
+    raw_model.print_params_number()
 
 # lr
 max_lr = 6e-4
@@ -418,7 +419,7 @@ for step in range(max_steps):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
